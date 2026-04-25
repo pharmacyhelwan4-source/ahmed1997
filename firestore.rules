@@ -1,0 +1,81 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isVerified() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    function isAdmin() { 
+      return isVerified() && 
+             exists(/databases/$(database)/documents/employees/$(request.auth.uid)) && 
+             get(/databases/$(database)/documents/employees/$(request.auth.uid)).data.role == 'admin'; 
+    }
+    function isValidId(id) { return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); }
+
+    // --- Employee Rules ---
+    match /employees/{employeeId} {
+      allow get: if isVerified();
+      allow list: if isVerified();
+      allow create: if isVerified() && (isAdmin() || request.auth.uid == employeeId) && isValidEmployee(incoming());
+      allow update: if isVerified() && (
+        isAdmin() || 
+        (request.auth.uid == employeeId && incoming().diff(existing()).affectedKeys().hasOnly(['name', 'isActive']))
+      );
+      
+      function isValidEmployee(data) {
+        return data.keys().hasAll(['uid', 'name', 'email', 'role', 'isActive']) &&
+               data.keys().size() == 5 &&
+               data.uid == request.auth.uid &&
+               data.name is string && data.name.size() <= 100 &&
+               data.email is string && data.email.size() <= 100 &&
+               data.role in ['admin', 'staff'] &&
+               data.isActive is bool;
+      }
+    }
+
+    // --- Notebook Rules ---
+    match /notebooks/{notebookId} {
+      allow read: if isVerified();
+      allow create: if isVerified() && isAdmin() && isValidNotebook(incoming());
+      allow update: if isVerified() && (
+        isAdmin() || 
+        (existing().assignedTo == request.auth.uid && isValidNotebookUpdate())
+      );
+
+      function isValidNotebook(data) {
+        return data.keys().hasAll(['type', 'month', 'year', 'computerNumber', 'currentStage', 'createdAt', 'assignedTo', 'assignedBy', 'stages']) &&
+               data.type in ['computer', 'invoice'] &&
+               data.month is number && data.month >= 1 && data.month <= 12 &&
+               data.year is number && data.year >= 2024 &&
+               data.computerNumber is number &&
+               data.currentStage is string &&
+               data.createdAt == request.time &&
+               data.assignedBy == request.auth.uid;
+      }
+
+      function isValidNotebookUpdate() {
+        let affected = incoming().diff(existing()).affectedKeys();
+        // Staff can only update stage progress and updatedAt
+        return affected.hasOnly(['currentStage', 'stages', 'updatedAt']) &&
+               incoming().updatedAt == request.time;
+      }
+    }
+
+    // --- Log Rules ---
+    match /logs/{logId} {
+      allow read: if isVerified() && isAdmin();
+      allow create: if isVerified() && 
+                    incoming().userId == request.auth.uid && 
+                    incoming().timestamp == request.time &&
+                    incoming().userName is string &&
+                    incoming().action is string &&
+                    incoming().details is string;
+    }
+  }
+}
